@@ -461,22 +461,28 @@ def find_skills_in(root: Path, subdir: str) -> list[dict]:
     if (base / "SKILL.md").is_file():
         add(base)
         return found
-    patterns = ["*/SKILL.md", "skills/*/SKILL.md", "*/skills/*/SKILL.md", "*/*/skills/*/SKILL.md"]
     seen = set()
-    for pat in patterns:
-        for md in base.glob(pat):
-            d = md.parent
-            rel_parts = d.relative_to(root).parts
-            if d in seen or any(part in HASH_EXCLUDE_DIRS or part.startswith(".")
-                                for part in rel_parts):
-                continue
-            seen.add(d)
-            add(d)
-    # dedupe by skill name (repos often ship duplicate copies); prefer the shallowest
+    for md in base.rglob("SKILL.md"):
+        d = md.parent
+        rel_parts = d.relative_to(root).parts
+        if len(rel_parts) > 4:
+            continue
+        if d in seen or any(part in HASH_EXCLUDE_DIRS for part in rel_parts):
+            continue
+        seen.add(d)
+        add(d)
+
+    # Repos often ship duplicate copies of a skill (e.g. both skills/<name>/ and
+    # .claude/skills/<name>/). Dedupe by name: visible paths beat hidden ones,
+    # then shallower beats deeper.
+    def rank(s: dict) -> tuple[int, int]:
+        hidden = any(p.startswith(".") for p in s["subdir"].split("/") if p)
+        return (1 if hidden else 0, s["subdir"].count("/"))
+
     by_name: dict[str, dict] = {}
     for s in found:
         cur = by_name.get(s["name"])
-        if cur is None or s["subdir"].count("/") < cur["subdir"].count("/"):
+        if cur is None or rank(s) < rank(cur):
             by_name[s["name"]] = s
     return list(by_name.values())
 
@@ -1238,7 +1244,10 @@ def update_git_skill(name: str, entry: dict, skills_dir: Path, args) -> tuple[st
 
         # case: upstream moved, clean local tree
         if upstream_moved and not local_dirty:
-            auto_ok = args.yes and not hold and not reasons
+            # --apply = the user already approved this named skill's update
+            # (agent/non-tty path for breaking-flagged skills); hold still wins.
+            auto_ok = (args.yes and not hold and not reasons) \
+                or (getattr(args, "apply", False) and not hold)
             if auto_ok:
                 return apply_update()
             choice = ask(f"{name}: update available",
@@ -1289,6 +1298,8 @@ def cmd_update(args):
     unknown = [n for n in names if n not in manifest.skills]
     if unknown:
         die(f"not in manifest: {', '.join(unknown)}")
+    if getattr(args, "apply", False) and not args.names:
+        die("--apply requires explicit skill names")
 
     updates_available = False
     results: dict[str, str] = {}
@@ -1441,6 +1452,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("update", parents=[common], help="check/apply updates")
     sp.add_argument("names", nargs="*", help="skills to update (default: all)")
+    sp.add_argument("--apply", action="store_true",
+                    help="apply updates for the NAMED skills even when flagged as "
+                         "breaking (hold skills still refuse); requires explicit names")
     sp.set_defaults(func=cmd_update)
 
     sp = sub.add_parser("remove", parents=[common], help="remove a skill (moved to backup)")

@@ -61,6 +61,7 @@ skills-manager update -n           # check everything (network, no writes)
 skills-manager update              # interactive apply; -y auto-applies clean updates
 skills-manager add owner/repo      # install; also URLs, /tree/<ref>/<path>, gists, local repo paths
 skills-manager add owner/repo --skill NAME --name ALIAS
+skills-manager update NAME --apply # apply a flagged (breaking) update after user approval
 skills-manager remove NAME         # moves to backup, drops manifest entry
 skills-manager snapshot NAME       # accept local edits as the new baseline
 skills-manager hold NAME [--off] [--note TEXT]
@@ -77,7 +78,8 @@ skills-manager adopt-one NAME      # register a dir that appeared after init
   `overwrite` and re-prints the adaptations note.
 - **Breaking-change flags** (major version bump, `BREAKING`/`!:` commits,
   frontmatter name/description changes, CHANGELOG touched) exclude a skill
-  from `-y` auto-apply — show the user the evidence first.
+  from `-y` auto-apply — show the user the evidence first, then apply the
+  ones they approve with `update <name> --apply` (hold skills still refuse).
 - When a plugin repo has several skills **and** extra artifacts
   (hooks/commands/agents/MCP), recommend installing it as a harness plugin
   instead of vendoring; vendor only the skills if the user prefers.
