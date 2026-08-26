@@ -6,7 +6,7 @@
 """skills-manager — manage a directory of agent skills (SKILL.md folders).
 
 A JSON manifest next to the skills directory is the single source of truth:
-which skills exist, which channel each came from (git / cli / monorepo /
+which skills exist, which channel each came from (git / cli / disk /
 local), the pinned commit, and a content hash of what was installed so local
 edits are always detected before an update can clobber them.
 
@@ -15,7 +15,7 @@ Channels:
             updates fetch + diff + interactive apply
   cli       a tool owns the skill set (e.g. hyperframes, plannotator);
             updates delegate to that tool's refresh command, or hands-off
-  monorepo  one-way copy from a path on disk; updates sync when present
+  disk      one-way copy from a path on disk; updates sync when present
   local     no upstream; never touched by update
 
 Conventions: -n/--dry-run (report only), -y/--yes (auto-confirm safe steps).
@@ -240,6 +240,12 @@ class Manifest:
         if not m.path.is_file():
             die(f"no manifest at {m.path} — run `skills-manager init --dir {skills_dir}` first")
         m.data = json.loads(m.path.read_text(encoding="utf-8"))
+        # migrate manifests written before the 'monorepo' channel was renamed to 'disk'
+        for e in m.data.get("skills", {}).values():
+            if e.get("channel") == "monorepo":
+                e["channel"] = "disk"
+            if "monorepo" in e:
+                e["disk"] = e.pop("monorepo")
         return m
 
     def exists(self) -> bool:
@@ -259,7 +265,7 @@ class Manifest:
 
 
 def new_entry(channel: str, description: str, *, source: dict | None = None,
-              cli: dict | None = None, monorepo: dict | None = None,
+              cli: dict | None = None, disk: dict | None = None,
               commit: str | None = None, version: str | None = None,
               tree: str | None = None, hold: bool = False,
               adaptations: str | None = None, note: str | None = None) -> dict:
@@ -280,8 +286,8 @@ def new_entry(channel: str, description: str, *, source: dict | None = None,
         entry["source"] = source
     if cli:
         entry["cli"] = cli
-    if monorepo:
-        entry["monorepo"] = monorepo
+    if disk:
+        entry["disk"] = disk
     if note:
         entry["note"] = note
     return entry
@@ -608,8 +614,8 @@ def fmt_upstream(entry: dict) -> str:
     if ch == "cli":
         cli = entry.get("cli", {})
         return f"{cli.get('owner', '?')} ({'hands-off' if not cli.get('refreshCommand') else cli['refreshCommand']})"
-    if ch == "monorepo":
-        return entry.get("monorepo", {}).get("sourcePath", "?")
+    if ch == "disk":
+        return entry.get("disk", {}).get("sourcePath", "?")
     return "—"
 
 
@@ -674,8 +680,8 @@ def classify_for_adopt(name: str, skill_dir: Path) -> dict:
                          tree=tree, hold=hold, adaptations=adaptations)
 
     if name in MONOREPO_SKILLS:
-        return new_entry("monorepo", desc,
-                         monorepo={"sourcePath": f"{MONOREPO_SOURCE_PREFIX}/{name}",
+        return new_entry("disk", desc,
+                         disk={"sourcePath": f"{MONOREPO_SOURCE_PREFIX}/{name}",
                                    "note": "one-way sync from work monorepo; source may be offline"},
                          version=str(meta.get("version")) if meta.get("version") else None,
                          tree=tree, hold=hold, adaptations=adaptations)
@@ -735,20 +741,20 @@ def cmd_init(args):
                 print(f"  unknown skill: {name}")
                 continue
             e = entries[name]
-            ch = input(f"  channel [{e['channel']}] (git/cli/monorepo/local): ").strip() or e["channel"]
+            ch = input(f"  channel [{e['channel']}] (git/cli/disk/local): ").strip() or e["channel"]
             if ch == "git":
                 repo = input(f"  repo URL [{e.get('source', {}).get('repo', '')}]: ").strip() \
                     or e.get("source", {}).get("repo", "")
                 sub = input(f"  subdir [{e.get('source', {}).get('subdir', '')}]: ").strip() \
                     or e.get("source", {}).get("subdir", "")
                 e["source"] = {"repo": repo, "subdir": sub, "ref": "HEAD"}
-                e.pop("cli", None); e.pop("monorepo", None)
-            elif ch == "monorepo":
+                e.pop("cli", None); e.pop("disk", None)
+            elif ch == "disk":
                 sp = input("  sourcePath: ").strip()
-                e["monorepo"] = {"sourcePath": sp, "note": ""}
+                e["disk"] = {"sourcePath": sp, "note": ""}
                 e.pop("source", None); e.pop("cli", None)
             elif ch == "local":
-                e.pop("source", None); e.pop("cli", None); e.pop("monorepo", None)
+                e.pop("source", None); e.pop("cli", None); e.pop("disk", None)
             e["channel"] = ch
             hold = input(f"  hold? [{'y' if e.get('hold') else 'n'}]: ").strip().lower()
             if hold in ("y", "n"):
@@ -932,9 +938,9 @@ def cmd_set_source(args):
         repo = normalize_repo_url(args.repo) or args.repo
         e["source"] = {"repo": repo, "subdir": args.subdir or "", "ref": args.ref or "HEAD"}
         e.pop("cli", None)
-        e.pop("monorepo", None)
-    elif channel == "monorepo":
-        e["monorepo"] = {"sourcePath": args.repo, "note": "set via set-source"}
+        e.pop("disk", None)
+    elif channel == "disk":
+        e["disk"] = {"sourcePath": args.repo, "note": "set via set-source"}
         e.pop("source", None)
         e.pop("cli", None)
     if args.commit:
@@ -1296,8 +1302,8 @@ def cmd_update(args):
         elif ch == "cli":
             group = entry.get("cli", {}).get("group", name)
             cli_groups.setdefault(group, []).append(name)
-        elif ch == "monorepo":
-            results[name] = update_monorepo_skill(name, entry, skills_dir, args)
+        elif ch == "disk":
+            results[name] = update_disk_skill(name, entry, skills_dir, args)
         elif ch == "git":
             state, flag = update_git_skill(name, entry, skills_dir, args)
             results[name] = state
@@ -1345,28 +1351,28 @@ def cmd_update(args):
         sys.exit(2)
 
 
-def update_monorepo_skill(name: str, entry: dict, skills_dir: Path, args) -> str:
-    sp = entry.get("monorepo", {}).get("sourcePath", "")
+def update_disk_skill(name: str, entry: dict, skills_dir: Path, args) -> str:
+    sp = entry.get("disk", {}).get("sourcePath", "")
     candidates = [Path(sp).expanduser()]
     if not sp.startswith(("/", "~")):
         candidates += [Path.home() / sp, Path.home() / "workspace" / sp,
                        Path.home() / "workspace" / "masorange" / "repos" / sp]
     source = next((c for c in candidates if c.is_dir()), None)
     if source is None:
-        return "monorepo source unavailable, skipped"
+        return "disk source unavailable, skipped"
     d = skills_dir / name
     if not d.is_dir():
         return "missing on disk"
     src_hash, disk_hash = tree_hash(source), tree_hash(d)
     if src_hash == disk_hash:
-        return "in sync with monorepo source"
+        return "in sync with disk source"
     if args.dry_run:
-        return f"differs from monorepo source ({source})"
-    choice = ask(f"{name}: differs from monorepo source {source}",
+        return f"differs from disk source ({source})"
+    choice = ask(f"{name}: differs from disk source {source}",
                  {"u": "sync from source (backup kept)", "d": "show diff", "s": "skip"},
                  default="s", assume_yes=args.yes)
     while choice == "d":
-        show_diff(d, source, "local", "monorepo source")
+        show_diff(d, source, "local", "disk source")
         choice = ask("next", {"u": "sync", "s": "skip"}, default="s")
     if choice == "u":
         bk = backup_tree(d, name)
@@ -1374,7 +1380,7 @@ def update_monorepo_skill(name: str, entry: dict, skills_dir: Path, args) -> str
         entry["installed"]["treeHash"] = tree_hash(d)
         entry["installed"]["updatedAt"] = today()
         print(f"  synced; previous copy backed up to {bk}")
-        return "synced from monorepo source"
+        return "synced from disk source"
     return "skipped"
 
 
@@ -1449,7 +1455,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("adopt-one", parents=[common], help="register one unmanaged skill dir")
     sp.add_argument("name")
-    sp.add_argument("--channel", choices=["git", "cli", "monorepo", "local"])
+    sp.add_argument("--channel", choices=["git", "cli", "disk", "local"])
     sp.add_argument("--repo")
     sp.add_argument("--subdir")
     sp.add_argument("--commit")
@@ -1479,7 +1485,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--subdir")
     sp.add_argument("--ref")
     sp.add_argument("--commit")
-    sp.add_argument("--channel", choices=["git", "monorepo"])
+    sp.add_argument("--channel", choices=["git", "disk"])
     sp.set_defaults(func=cmd_set_source)
 
     return p
