@@ -13,7 +13,7 @@ edits are always detected before an update can clobber them.
 Channels:
   git       upstream is a git repo (GitHub, any URL, or a local path);
             updates fetch + diff + interactive apply
-  cli       a tool owns the skill set (e.g. hyperframes, plannotator);
+  cli       a tool owns the skill set (a generator or installer binary);
             updates delegate to that tool's refresh command, or hands-off
   disk      one-way copy from a path on disk; updates sync when present
   local     no upstream; never touched by update
@@ -62,7 +62,8 @@ NON_SKILL_ROOT_FILES = {MANIFEST_NAME, MANIFEST_NAME + ".bak",
 #                    "skills": ["<name>", ...]}
 #     },
 #     "disk": {"sourcePathPrefix": "<dir the copies come from>",
-#              "note": "<free text>", "skills": ["<name>", ...]},
+#              "note": "<free text>", "skills": ["<name>", ...],
+#              "searchPaths": ["<base dir to resolve relative sourcePaths>", ...]},
 #     "hold": ["<name>", ...]
 #   }
 #
@@ -1394,8 +1395,10 @@ def update_disk_skill(name: str, entry: dict, skills_dir: Path, args) -> str:
     sp = entry.get("disk", {}).get("sourcePath", "")
     candidates = [Path(sp).expanduser()]
     if not sp.startswith(("/", "~")):
-        candidates += [Path.home() / sp, Path.home() / "workspace" / sp,
-                       Path.home() / "workspace" / "masorange" / "repos" / sp]
+        # relative sourcePaths resolve against $HOME plus any hints searchPaths
+        candidates.append(Path.home() / sp)
+        for base in (load_hints(skills_dir).get("disk") or {}).get("searchPaths") or []:
+            candidates.append(Path(base).expanduser() / sp)
     source = next((c for c in candidates if c.is_dir()), None)
     if source is None:
         return "disk source unavailable, skipped"
