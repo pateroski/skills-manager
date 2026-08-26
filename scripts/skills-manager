@@ -667,15 +667,6 @@ def classify_for_adopt(name: str, skill_dir: Path, hints: dict | None = None) ->
                              "refreshCommand": spec.get("refreshCommand"),
                              "group": group}, tree=tree)
 
-    # OpenSpec's CLI owns skills it generated: it drops an ownership marker
-    # (.openspec-target) into the skills root, and `openspec update <project>`
-    # regenerates them (projectPath = two levels above the skills dir).
-    if name.startswith("openspec-") and (skill_dir.parent / ".openspec-target").is_file():
-        project = skill_dir.parent.parent
-        return new_entry("cli", desc, cli={"owner": "openspec",
-                         "refreshCommand": f'openspec update "{project}"',
-                         "group": "openspec"}, tree=tree)
-
     src = meta.get("source")
     repo = normalize_repo_url(str(src)) if src else None
     if repo:

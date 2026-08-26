@@ -50,9 +50,11 @@ skills-manager init --dir <folder>      # review, edit rows, confirm, write mani
 
 Works on any folder containing `*/SKILL.md`; no prior metadata needed.
 Classification order: CLI groups from the optional hints file → frontmatter
-`metadata.source` → CLI ownership markers (e.g. OpenSpec's
-`.openspec-target`) → URL hints → disk hints → `local`. Skills with an
-embedded `.git` trigger a prompt to archive it to the backup area.
+`metadata.source` → URL hints → disk hints → `local`. The script knows no
+specific skill or tool — CLI ownership is something you discover while using
+the skill (see the research rule below) and record via `set-source
+--channel cli` or the hints file. Skills with an embedded `.git` trigger a
+prompt to archive it to the backup area.
 
 Machine-specific knowledge (CLI groups, disk-copied skills, hold names)
 never lives in the script — put it in `skills-manager.hints.json` next to
