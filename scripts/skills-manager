@@ -1,0 +1,1498 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml"]
+# ///
+"""skills-manager — manage a directory of agent skills (SKILL.md folders).
+
+A JSON manifest next to the skills directory is the single source of truth:
+which skills exist, which channel each came from (git / cli / monorepo /
+local), the pinned commit, and a content hash of what was installed so local
+edits are always detected before an update can clobber them.
+
+Channels:
+  git       upstream is a git repo (GitHub, any URL, or a local path);
+            updates fetch + diff + interactive apply
+  cli       a tool owns the skill set (e.g. hyperframes, plannotator);
+            updates delegate to that tool's refresh command, or hands-off
+  monorepo  one-way copy from a path on disk; updates sync when present
+  local     no upstream; never touched by update
+
+Conventions: -n/--dry-run (report only), -y/--yes (auto-confirm safe steps).
+Exit codes: 0 ok, 1 error, 2 = `update -n` found available updates.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+MANIFEST_NAME = "skills-manifest.json"
+MANIFEST_VERSION = 1
+DEFAULT_SKILLS_DIR = Path.home() / ".agents" / "skills"
+CACHE_ROOT = Path.home() / ".cache" / "skills-manager"
+REPO_CACHE = CACHE_ROOT / "repos"
+BACKUP_ROOT = CACHE_ROOT / "backups"
+HASH_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules"}
+HASH_EXCLUDE_FILES = {".DS_Store"}
+NON_SKILL_ROOT_FILES = {MANIFEST_NAME, MANIFEST_NAME + ".bak"}
+
+# --- Adoption seed lists: consulted only by `init` / `adopt-one`. ---------
+HYPERFRAMES_SKILLS = {
+    "hyperframes", "hyperframes-animation", "hyperframes-audio",
+    "hyperframes-cli", "hyperframes-core", "hyperframes-creative",
+    "hyperframes-keyframes", "hyperframes-registry", "embedded-captions",
+    "faceless-explainer", "figma", "general-video", "media-use",
+    "motion-graphics", "music-to-video", "pr-to-video",
+    "product-launch-video", "remotion-to-hyperframes", "slideshow",
+    "talking-head-recut",
+}
+PLANNOTATOR_SKILLS = {
+    "plannotator", "plannotator-annotate", "plannotator-last",
+    "plannotator-review", "plannotator-compound", "plannotator-setup-goal",
+    "plannotator-visual-explainer",
+}
+MONOREPO_SKILLS = {
+    "openspec-core", "openspec-apply-change", "openspec-archive-change",
+    "openspec-bulk-archive-change", "openspec-continue-change",
+    "openspec-explore", "openspec-ff-change", "openspec-new-change",
+    "openspec-onboard", "openspec-propose", "openspec-sync-specs",
+    "openspec-verify-change", "nx-monorepo", "frontend-dev-guidelines",
+    "cfront-ai-news", "commit-and-push", "pr-create", "pr-review", "learn",
+    "playwright-cli", "simple-english", "ui-skills",
+    "vercel-react-best-practices", "vercel-web-design-guidelines",
+}
+MONOREPO_SOURCE_PREFIX = "monorepo-front/.agents/skills"
+HOLD_SEEDS = {"learn-codebase", "learning-opportunities", "explain-diff", "humanizer"}
+CLI_GROUPS = {
+    "hyperframes": {"refreshCommand": "npx -y hyperframes skills"},
+    "plannotator": {"refreshCommand": None},
+}
+
+URL_RE = re.compile(
+    r"https?://(?:www\.)?(github\.com|gitlab\.com|gist\.github\.com)/[\w.\-]+(?:/[\w.\-]+)?"
+)
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def die(msg: str, code: int = 1):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg: str):
+    print(f"warning: {msg}", file=sys.stderr)
+
+
+def run(cmd: list[str], cwd: Path | None = None, check: bool = True,
+        capture: bool = True, timeout: int = 300) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd, cwd=str(cwd) if cwd else None, check=check,
+        capture_output=capture, text=True, timeout=timeout,
+    )
+
+
+def interactive() -> bool:
+    return sys.stdin.isatty()
+
+
+def ask(prompt: str, choices: dict[str, str], default: str, assume_yes: bool = False) -> str:
+    """choices: key -> label. Returns chosen key. Non-tty or -y => default."""
+    if assume_yes or not interactive():
+        return default
+    keys = "/".join(k.upper() if k == default else k for k in choices)
+    for k, label in choices.items():
+        print(f"    [{k}] {label}")
+    while True:
+        ans = input(f"  choose [{keys}]: ").strip().lower()
+        if not ans:
+            return default
+        if ans in choices:
+            return ans
+        print(f"  invalid choice: {ans!r}")
+
+
+def confirm(prompt: str, default: bool = False, assume_yes: bool = False) -> bool:
+    if assume_yes:
+        return True
+    if not interactive():
+        return default
+    suffix = "[Y/n]" if default else "[y/N]"
+    ans = input(f"{prompt} {suffix} ").strip().lower()
+    if not ans:
+        return default
+    return ans in ("y", "yes")
+
+
+def confirm_typed(prompt: str, word: str) -> bool:
+    if not interactive():
+        return False
+    ans = input(f"{prompt} (type '{word}' to proceed): ").strip()
+    return ans == word
+
+
+# --------------------------------------------------------------------------
+# frontmatter + hashing
+# --------------------------------------------------------------------------
+
+def parse_frontmatter(skill_dir: Path) -> dict | None:
+    md = skill_dir / "SKILL.md"
+    if not md.is_file():
+        return None
+    try:
+        text = md.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return {}
+    m = re.match(r"^---\s*\n(.*?)\n---\s*(\n|$)", text, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        data = yaml.safe_load(m.group(1))
+        return data if isinstance(data, dict) else {}
+    except yaml.YAMLError:
+        return None  # unparseable, caller decides
+
+
+def skill_body(skill_dir: Path) -> str:
+    md = skill_dir / "SKILL.md"
+    if not md.is_file():
+        return ""
+    text = md.read_text(encoding="utf-8", errors="replace")
+    m = re.match(r"^---\s*\n.*?\n---\s*\n", text, re.DOTALL)
+    return text[m.end():] if m else text
+
+
+def short_description(fm: dict | None) -> str:
+    desc = (fm or {}).get("description") or ""
+    desc = " ".join(str(desc).split())
+    first = desc.split(". ")[0]
+    return (first[:137] + "...") if len(first) > 140 else first
+
+
+def tree_hash(root: Path) -> str:
+    lines = []
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            continue
+        rel = path.relative_to(root)
+        if any(part in HASH_EXCLUDE_DIRS for part in rel.parts):
+            continue
+        if rel.name in HASH_EXCLUDE_FILES or rel.name.endswith(".pyc"):
+            continue
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+        except OSError:
+            continue
+        lines.append(f"{rel.as_posix()}\0{h.hexdigest()}\n")
+    total = hashlib.sha256("".join(lines).encode()).hexdigest()
+    return f"sha256:{total}"
+
+
+# --------------------------------------------------------------------------
+# manifest
+# --------------------------------------------------------------------------
+
+class Manifest:
+    def __init__(self, skills_dir: Path):
+        self.skills_dir = skills_dir
+        self.path = skills_dir / MANIFEST_NAME
+        self.data: dict = {
+            "manifestVersion": MANIFEST_VERSION,
+            "skillsDir": str(skills_dir),
+            "updatedAt": utc_now(),
+            "skills": {},
+        }
+
+    @classmethod
+    def load(cls, skills_dir: Path) -> "Manifest":
+        m = cls(skills_dir)
+        if not m.path.is_file():
+            die(f"no manifest at {m.path} — run `skills-manager init --dir {skills_dir}` first")
+        m.data = json.loads(m.path.read_text(encoding="utf-8"))
+        return m
+
+    def exists(self) -> bool:
+        return self.path.is_file()
+
+    @property
+    def skills(self) -> dict:
+        return self.data["skills"]
+
+    def save(self):
+        self.data["updatedAt"] = utc_now()
+        if self.path.is_file():
+            shutil.copy2(self.path, self.path.with_suffix(".json.bak"))
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, self.path)
+
+
+def new_entry(channel: str, description: str, *, source: dict | None = None,
+              cli: dict | None = None, monorepo: dict | None = None,
+              commit: str | None = None, version: str | None = None,
+              tree: str | None = None, hold: bool = False,
+              adaptations: str | None = None, note: str | None = None) -> dict:
+    entry: dict = {
+        "channel": channel,
+        "description": description,
+        "installed": {
+            "commit": commit,
+            "version": version,
+            "treeHash": tree,
+            "installedAt": today(),
+            "updatedAt": today(),
+        },
+        "hold": hold,
+        "adaptations": adaptations,
+    }
+    if source:
+        entry["source"] = source
+    if cli:
+        entry["cli"] = cli
+    if monorepo:
+        entry["monorepo"] = monorepo
+    if note:
+        entry["note"] = note
+    return entry
+
+
+# --------------------------------------------------------------------------
+# git engine
+# --------------------------------------------------------------------------
+
+def normalize_repo_url(text: str) -> str | None:
+    """Normalize frontmatter-style 'github.com/o/r' or full URLs to a cloneable URL."""
+    text = text.strip().rstrip("/")
+    if re.match(r"^(https?://|git@)", text):
+        return text
+    if re.match(r"^(github\.com|gitlab\.com|gist\.github\.com)/", text):
+        return "https://" + text
+    return None
+
+
+def resolve_source(spec: str) -> dict:
+    """Return {'repo', 'ref', 'subdir'}. Accepts owner/repo[/sub/dir],
+    GitHub URLs (incl. /tree/<ref>/<path>), gist URLs, any git URL,
+    or a local filesystem path to a git repo."""
+    spec = spec.strip()
+    p = Path(spec).expanduser()
+    if spec.startswith(("/", "~", ".")) or p.is_dir():
+        p = p.resolve()
+        if not (p / ".git").exists():
+            die(f"{p} is not a git repository")
+        return {"repo": str(p), "ref": "HEAD", "subdir": ""}
+    m = re.match(r"^https://github\.com/([\w.\-]+)/([\w.\-]+)/tree/([^/]+)(?:/(.*))?$", spec)
+    if m:
+        owner, repo, ref, sub = m.groups()
+        return {"repo": f"https://github.com/{owner}/{repo}", "ref": ref, "subdir": sub or ""}
+    m = re.match(r"^https://gist\.github\.com/[\w\-]+/([0-9a-f]+)", spec)
+    if m:
+        return {"repo": f"https://gist.github.com/{m.group(1)}.git", "ref": "HEAD", "subdir": ""}
+    if re.match(r"^(https?://|git@)", spec):
+        return {"repo": re.sub(r"\.git$", "", spec) if "github.com" in spec else spec,
+                "ref": "HEAD", "subdir": ""}
+    m = re.match(r"^([\w.\-]+)/([\w.\-]+)(?:/(.*))?$", spec)
+    if m:
+        owner, repo, sub = m.groups()
+        return {"repo": f"https://github.com/{owner}/{repo}", "ref": "HEAD", "subdir": sub or ""}
+    die(f"cannot parse source spec: {spec!r}")
+
+
+def cache_dir_for(repo: str) -> Path:
+    slug = re.sub(r"[^\w.\-]+", "__", re.sub(r"^https?://", "", repo)).strip("_")
+    return REPO_CACHE / slug
+
+
+def ls_remote(repo: str, ref: str) -> str | None:
+    target = [] if ref == "HEAD" else [ref]
+    try:
+        r = run(["git", "ls-remote", repo, "HEAD"] if ref == "HEAD"
+                else ["git", "ls-remote", repo, *target], timeout=60)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    for line in r.stdout.splitlines():
+        sha, _, name = line.partition("\t")
+        if ref == "HEAD" and name.strip() == "HEAD":
+            return sha
+        if ref != "HEAD" and name.strip().endswith(ref):
+            return sha
+    return None
+
+
+def ensure_repo(repo: str, ref: str) -> tuple[Path, str]:
+    """Clone/refresh the cache for repo@ref, checkout detached. Returns (cache, full sha)."""
+    REPO_CACHE.mkdir(parents=True, exist_ok=True)
+    cache = cache_dir_for(repo)
+
+    def clone():
+        if cache.exists():
+            shutil.rmtree(cache)
+        cmd = ["git", "clone", "--depth", "1", "--single-branch"]
+        if ref != "HEAD":
+            cmd += ["--branch", ref]
+        cmd += [repo, str(cache)]
+        run(cmd, timeout=600)
+
+    if not (cache / ".git").exists():
+        clone()
+    else:
+        fetch_ref = ref if ref != "HEAD" else "HEAD"
+        try:
+            run(["git", "fetch", "--depth", "1", "origin", fetch_ref], cwd=cache, timeout=600)
+            run(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=cache)
+        except subprocess.CalledProcessError:
+            clone()
+    if not (cache / ".git").exists():
+        die(f"failed to prepare cache for {repo}")
+    sha = run(["git", "rev-parse", "HEAD"], cwd=cache).stdout.strip()
+    return cache, sha
+
+
+def resolve_commit(cache: Path, committish: str) -> str | None:
+    """Resolve (possibly short) sha in cache, deepening the shallow clone if needed."""
+    def rp() -> str | None:
+        r = run(["git", "rev-parse", "--verify", committish + "^{commit}"], cwd=cache, check=False)
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    sha = rp()
+    if sha:
+        return sha
+    if re.fullmatch(r"[0-9a-f]{40}", committish):
+        run(["git", "fetch", "--depth", "1", "origin", committish], cwd=cache, check=False, timeout=600)
+        sha = rp()
+        if sha:
+            return sha
+    for depth in ("200", "2000"):
+        run(["git", "fetch", f"--depth={depth}", "origin"], cwd=cache, check=False, timeout=600)
+        sha = rp()
+        if sha:
+            return sha
+    run(["git", "fetch", "--unshallow", "origin"], cwd=cache, check=False, timeout=900)
+    return rp()
+
+
+def extract_tree(cache: Path, commit: str, subdir: str, dest: Path):
+    """Extract <subdir> at <commit> from the cache repo into dest (dest becomes the skill dir)."""
+    dest.mkdir(parents=True, exist_ok=True)
+    prefix = f"{subdir.rstrip('/')}/" if subdir else ""
+    with tempfile.TemporaryDirectory(prefix="skm-extract-") as td:
+        tar = Path(td) / "tree.tar"
+        cmd = ["git", "archive", "--format=tar", "-o", str(tar), commit]
+        if subdir:
+            cmd.append(subdir)
+        run(cmd, cwd=cache)
+        run(["tar", "-xf", str(tar), "-C", td, "--exclude", ".git"])
+        src = Path(td) / prefix if prefix else Path(td)
+        if not src.is_dir():
+            die(f"subdir {subdir!r} not found at {commit[:9]}")
+        for item in src.iterdir():
+            if item.name == "tree.tar":
+                continue
+            target = dest / item.name
+            if item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, target)
+
+
+def git_log_range(cache: Path, old: str | None, new: str, subdir: str) -> list[str]:
+    rng = f"{old}..{new}" if old else new
+    cmd = ["git", "log", "--oneline", "--no-decorate", rng]
+    if subdir:
+        cmd += ["--", subdir]
+    r = run(cmd, cwd=cache, check=False)
+    return r.stdout.splitlines() if r.returncode == 0 else []
+
+
+# --------------------------------------------------------------------------
+# discovery inside a fetched repo / plugin detection
+# --------------------------------------------------------------------------
+
+def find_skills_in(root: Path, subdir: str) -> list[dict]:
+    """Return [{'name', 'subdir', 'fm'}] for skills found under root/subdir."""
+    base = root / subdir if subdir else root
+    if not base.is_dir():
+        die(f"path {subdir!r} not found in fetched repo")
+    found = []
+
+    def add(d: Path):
+        fm = parse_frontmatter(d) or {}
+        fallback = d.name if d != root else root.name
+        rel = d.relative_to(root).as_posix() if d != root else ""
+        found.append({"name": str(fm.get("name") or fallback), "subdir": rel, "fm": fm})
+
+    if (base / "SKILL.md").is_file():
+        add(base)
+        return found
+    patterns = ["*/SKILL.md", "skills/*/SKILL.md", "*/skills/*/SKILL.md", "*/*/skills/*/SKILL.md"]
+    seen = set()
+    for pat in patterns:
+        for md in base.glob(pat):
+            d = md.parent
+            rel_parts = d.relative_to(root).parts
+            if d in seen or any(part in HASH_EXCLUDE_DIRS or part.startswith(".")
+                                for part in rel_parts):
+                continue
+            seen.add(d)
+            add(d)
+    # dedupe by skill name (repos often ship duplicate copies); prefer the shallowest
+    by_name: dict[str, dict] = {}
+    for s in found:
+        cur = by_name.get(s["name"])
+        if cur is None or s["subdir"].count("/") < cur["subdir"].count("/"):
+            by_name[s["name"]] = s
+    return list(by_name.values())
+
+
+def plugin_info(root: Path) -> dict | None:
+    """Detect a harness plugin and inventory non-skill artifacts."""
+    meta = None
+    for candidate in (".claude-plugin/plugin.json", ".claude-plugin/marketplace.json"):
+        f = root / candidate
+        if f.is_file():
+            try:
+                meta = json.loads(f.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                meta = {}
+            kind = "marketplace" if "marketplace" in candidate else "plugin"
+            break
+    else:
+        return None
+    artifacts = []
+    for d, label in (("hooks", "hooks"), ("commands", "commands"),
+                     ("agents", "agents"), ("mcp", "MCP servers")):
+        if (root / d).is_dir() or (root / d / f"{d}.json").is_file():
+            artifacts.append(label)
+    if (root / ".mcp.json").is_file():
+        artifacts.append("MCP servers")
+    return {"kind": kind, "name": (meta or {}).get("name") or root.name,
+            "artifacts": sorted(set(artifacts))}
+
+
+def find_url_hints(skill_dir: Path) -> list[str]:
+    """Tier-1 discovery: grep skill files for repo URLs."""
+    hits: list[str] = []
+    for f in ("SKILL.md", "README.md", "LICENSE", "metadata.json"):
+        p = skill_dir / f
+        if not p.is_file():
+            continue
+        text = p.read_text(encoding="utf-8", errors="replace")
+        for m in URL_RE.finditer(text):
+            url = m.group(0).rstrip(".,)")
+            if url not in hits:
+                hits.append(url)
+    return hits
+
+
+# --------------------------------------------------------------------------
+# backups + apply
+# --------------------------------------------------------------------------
+
+def backup_tree(src: Path, label: str) -> Path:
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    dest = BACKUP_ROOT / f"{label}-{stamp()}"
+    shutil.move(str(src), str(dest))
+    return dest
+
+
+def install_from_cache(cache: Path, commit: str, subdir: str, dest: Path) -> str:
+    """Extract to temp, backup dest if present, swap in. Returns new treeHash."""
+    with tempfile.TemporaryDirectory(prefix="skm-install-", dir=str(dest.parent)) as td:
+        staging = Path(td) / "skill"
+        extract_tree(cache, commit, subdir, staging)
+        if dest.exists():
+            bk = backup_tree(dest, dest.name)
+            print(f"  previous version backed up to {bk}")
+        shutil.move(str(staging), str(dest))
+    return tree_hash(dest)
+
+
+# --------------------------------------------------------------------------
+# breaking-change detection
+# --------------------------------------------------------------------------
+
+def semver_major(version: str | None) -> int | None:
+    if not version:
+        return None
+    m = re.match(r"v?(\d+)", str(version))
+    return int(m.group(1)) if m else None
+
+
+def breaking_reasons(cache: Path, old_commit: str | None, new_commit: str,
+                     subdir: str, old_fm: dict | None, new_fm: dict | None) -> list[str]:
+    reasons = []
+    old_ver = ((old_fm or {}).get("metadata") or {}).get("version")
+    new_ver = ((new_fm or {}).get("metadata") or {}).get("version")
+    om, nm = semver_major(old_ver), semver_major(new_ver)
+    if om is not None and nm is not None and nm > om:
+        reasons.append(f"major version bump {old_ver} -> {new_ver}")
+    if old_fm is not None and new_fm is not None:
+        for field in ("name", "description"):
+            if old_fm.get(field) != new_fm.get(field):
+                reasons.append(f"SKILL.md frontmatter '{field}' changed (affects triggering)")
+    if old_commit:
+        subjects = git_log_range(cache, old_commit, new_commit, subdir)
+        breaking = [s for s in subjects if re.search(r"(!:|BREAKING[ -]CHANGE)", s, re.IGNORECASE)]
+        for s in breaking[:5]:
+            reasons.append(f"breaking commit: {s}")
+        chlog = git_log_range(cache, old_commit, new_commit, f"{subdir}/CHANGELOG.md".lstrip("/"))
+        if chlog:
+            reasons.append("CHANGELOG.md changed in range (review it)")
+    return reasons
+
+
+# --------------------------------------------------------------------------
+# shared prep
+# --------------------------------------------------------------------------
+
+def get_skills_dir(args) -> Path:
+    d = Path(args.dir).expanduser().resolve() if args.dir else DEFAULT_SKILLS_DIR
+    if not d.is_dir():
+        die(f"skills directory not found: {d}")
+    return d
+
+
+def scan_skill_dirs(skills_dir: Path) -> tuple[list[Path], list[Path]]:
+    dirs, strays = [], []
+    for entry in sorted(skills_dir.iterdir()):
+        if entry.name.startswith("."):
+            continue
+        if entry.is_dir():
+            if (entry / "SKILL.md").is_file():
+                dirs.append(entry)
+            else:
+                strays.append(entry)
+        elif entry.name not in NON_SKILL_ROOT_FILES:
+            strays.append(entry)
+    return dirs, strays
+
+
+def fmt_upstream(entry: dict) -> str:
+    ch = entry["channel"]
+    if ch == "git":
+        src = entry.get("source", {})
+        rep = src.get("repo", "?")
+        rep = re.sub(r"^https://(www\.)?", "", rep)
+        return rep + (f":{src['subdir']}" if src.get("subdir") else "")
+    if ch == "cli":
+        cli = entry.get("cli", {})
+        return f"{cli.get('owner', '?')} ({'hands-off' if not cli.get('refreshCommand') else cli['refreshCommand']})"
+    if ch == "monorepo":
+        return entry.get("monorepo", {}).get("sourcePath", "?")
+    return "—"
+
+
+def print_table(rows: list[list[str]], headers: list[str]):
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+    line = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+    print(line)
+    print("  ".join("-" * w for w in widths))
+    for row in rows:
+        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+
+
+# --------------------------------------------------------------------------
+# init / adopt
+# --------------------------------------------------------------------------
+
+def classify_for_adopt(name: str, skill_dir: Path) -> dict:
+    fm = parse_frontmatter(skill_dir)
+    if fm is None:
+        return new_entry("local", "", note="frontmatter unparseable",
+                         tree=tree_hash(skill_dir))
+    desc = short_description(fm)
+    meta = fm.get("metadata") or {}
+    adaptations = meta.get("adaptations")
+    if isinstance(adaptations, (list, dict)):
+        adaptations = json.dumps(adaptations, ensure_ascii=False)
+    hold = name in HOLD_SEEDS or bool(adaptations)
+    tree = tree_hash(skill_dir)
+
+    if name in HYPERFRAMES_SKILLS:
+        return new_entry("cli", desc, cli={"owner": "hyperframes",
+                         "refreshCommand": CLI_GROUPS["hyperframes"]["refreshCommand"],
+                         "group": "hyperframes"}, tree=tree)
+    if name in PLANNOTATOR_SKILLS:
+        return new_entry("cli", desc, cli={"owner": "plannotator",
+                         "refreshCommand": None, "group": "plannotator"}, tree=tree)
+
+    src = meta.get("source")
+    repo = normalize_repo_url(str(src)) if src else None
+    if repo:
+        commit = meta.get("sourceCommit")
+        # frontmatter 'source' may include a path inside the repo
+        subdir = ""
+        m = re.match(r"^https://github\.com/[\w.\-]+/[\w.\-]+/(?:tree/[^/]+/)?(.+)$", repo)
+        if m:
+            subdir = m.group(1)
+            repo = repo[: m.start(1)].rstrip("/").removesuffix("/tree").rstrip("/")
+            repo = re.sub(r"/tree/[^/]+$", "", repo)
+        return new_entry("git", desc,
+                         source={"repo": repo, "subdir": subdir, "ref": "HEAD"},
+                         commit=str(commit) if commit else None,
+                         version=str(meta.get("version")) if meta.get("version") else None,
+                         tree=tree, hold=hold, adaptations=adaptations)
+
+    homepage = (meta.get("openclaw") or {}).get("homepage") if isinstance(meta.get("openclaw"), dict) else None
+    repo = normalize_repo_url(str(homepage)) if homepage else None
+    if repo:
+        return new_entry("git", desc, source={"repo": repo, "subdir": "", "ref": "HEAD"},
+                         tree=tree, hold=hold, adaptations=adaptations)
+
+    if name in MONOREPO_SKILLS:
+        return new_entry("monorepo", desc,
+                         monorepo={"sourcePath": f"{MONOREPO_SOURCE_PREFIX}/{name}",
+                                   "note": "one-way sync from work monorepo; source may be offline"},
+                         version=str(meta.get("version")) if meta.get("version") else None,
+                         tree=tree, hold=hold, adaptations=adaptations)
+
+    hints = find_url_hints(skill_dir)
+    note = f"url hints found: {', '.join(hints[:3])} — confirm with `set-source` or run `discover`" if hints else None
+    return new_entry("local", desc, tree=tree, hold=hold, adaptations=adaptations, note=note)
+
+
+def cmd_init(args):
+    skills_dir = get_skills_dir(args)
+    manifest = Manifest(skills_dir)
+    if manifest.exists() and not args.force:
+        die(f"manifest already exists at {manifest.path} (use --force to re-adopt)")
+
+    dirs, strays = scan_skill_dirs(skills_dir)
+    if not dirs:
+        die(f"no skills (*/SKILL.md) found in {skills_dir}")
+
+    print(f"Adopting {len(dirs)} skills in {skills_dir}\n")
+    entries: dict[str, dict] = {}
+    for d in dirs:
+        entries[d.name] = classify_for_adopt(d.name, d)
+
+    rows = []
+    for name, e in sorted(entries.items()):
+        flags = []
+        if e.get("hold"):
+            flags.append("HOLD")
+        if e.get("note"):
+            flags.append("note")
+        rows.append([name, e["channel"], fmt_upstream(e),
+                     (e["installed"]["commit"] or "")[:9], ",".join(flags)])
+    print_table(rows, ["skill", "channel", "upstream", "pin", "flags"])
+
+    notes = [(n, e["note"]) for n, e in sorted(entries.items()) if e.get("note")]
+    if notes:
+        print("\nNotes:")
+        for n, note in notes:
+            print(f"  {n}: {note}")
+    if strays:
+        print("\nNon-skill entries in the skills dir (left untouched):")
+        for s in strays:
+            print(f"  {s.name}")
+
+    if args.dry_run:
+        print("\ndry-run: manifest not written")
+        return
+
+    # interactive row overrides
+    if interactive() and not args.yes:
+        while True:
+            name = input("\nEdit a row? (skill name, or blank to continue): ").strip()
+            if not name:
+                break
+            if name not in entries:
+                print(f"  unknown skill: {name}")
+                continue
+            e = entries[name]
+            ch = input(f"  channel [{e['channel']}] (git/cli/monorepo/local): ").strip() or e["channel"]
+            if ch == "git":
+                repo = input(f"  repo URL [{e.get('source', {}).get('repo', '')}]: ").strip() \
+                    or e.get("source", {}).get("repo", "")
+                sub = input(f"  subdir [{e.get('source', {}).get('subdir', '')}]: ").strip() \
+                    or e.get("source", {}).get("subdir", "")
+                e["source"] = {"repo": repo, "subdir": sub, "ref": "HEAD"}
+                e.pop("cli", None); e.pop("monorepo", None)
+            elif ch == "monorepo":
+                sp = input("  sourcePath: ").strip()
+                e["monorepo"] = {"sourcePath": sp, "note": ""}
+                e.pop("source", None); e.pop("cli", None)
+            elif ch == "local":
+                e.pop("source", None); e.pop("cli", None); e.pop("monorepo", None)
+            e["channel"] = ch
+            hold = input(f"  hold? [{'y' if e.get('hold') else 'n'}]: ").strip().lower()
+            if hold in ("y", "n"):
+                e["hold"] = hold == "y"
+            print(f"  updated {name}")
+
+    # humanizer-style embedded .git dirs
+    for d in dirs:
+        if (d / ".git").exists():
+            e = entries[d.name]
+            head = run(["git", "rev-parse", "HEAD"], cwd=d, check=False).stdout.strip()
+            if head and e["channel"] == "git":
+                e["installed"]["commit"] = head
+                dirty = run(["git", "status", "--porcelain"], cwd=d, check=False).stdout.strip()
+                if dirty:
+                    e["hold"] = True
+                    files = ", ".join(line.split(maxsplit=1)[-1] for line in dirty.splitlines()[:5])
+                    e["adaptations"] = e.get("adaptations") or f"local edits (uncommitted at adopt time): {files}"
+            print(f"\n{d.name} contains an embedded .git (HEAD {head[:9] if head else '?'})")
+            if confirm(f"Archive {d.name}/.git to the backup area? (recommended)",
+                       default=True, assume_yes=args.yes):
+                bk = backup_tree(d / ".git", f"{d.name}-dotgit")
+                print(f"  archived to {bk}")
+                e["installed"]["treeHash"] = tree_hash(d)
+
+    if not confirm(f"\nWrite manifest with {len(entries)} skills to {manifest.path}?",
+                   default=True, assume_yes=args.yes):
+        print("aborted")
+        return
+    manifest.data["skills"] = entries
+    manifest.save()
+    print(f"manifest written: {manifest.path}")
+    unresolved = [n for n, e in entries.items() if e["channel"] == "local" and e.get("note")]
+    if unresolved:
+        print(f"\n{len(unresolved)} skills have URL hints but no confirmed upstream: "
+              f"{', '.join(unresolved)}")
+        print("Run `skills-manager discover` for an agent-assisted research brief, "
+              "then record results with `skills-manager set-source`.")
+
+
+# --------------------------------------------------------------------------
+# status
+# --------------------------------------------------------------------------
+
+def cmd_status(args):
+    skills_dir = get_skills_dir(args)
+    manifest = Manifest.load(skills_dir)
+    dirs, strays = scan_skill_dirs(skills_dir)
+    on_disk = {d.name: d for d in dirs}
+
+    report = []
+    for name, e in sorted(manifest.skills.items()):
+        d = on_disk.get(name)
+        drift = missing = False
+        if d is None:
+            missing = True
+        elif e["installed"].get("treeHash"):
+            drift = tree_hash(d) != e["installed"]["treeHash"]
+        report.append({
+            "name": name, "channel": e["channel"], "upstream": fmt_upstream(e),
+            "commit": (e["installed"].get("commit") or "")[:9],
+            "version": e["installed"].get("version"),
+            "updatedAt": e["installed"].get("updatedAt"),
+            "hold": bool(e.get("hold")), "drift": drift, "missing": missing,
+        })
+    unmanaged = sorted(set(on_disk) - set(manifest.skills))
+
+    if args.json:
+        print(json.dumps({"skillsDir": str(skills_dir), "skills": report,
+                          "unmanaged": unmanaged}, indent=2))
+        return
+    if args.md:
+        print(f"# Skills register — {skills_dir}\n")
+        print("| Skill | Channel | Upstream | Installed | Updated | Flags |")
+        print("| --- | --- | --- | --- | --- | --- |")
+        for r in report:
+            flags = " ".join(f for f, on in
+                             (("HOLD", r["hold"]), ("drift", r["drift"]), ("MISSING", r["missing"])) if on)
+            installed = r["commit"] or r["version"] or "—"
+            print(f"| {r['name']} | {r['channel']} | {r['upstream']} | `{installed}` "
+                  f"| {r['updatedAt']} | {flags} |")
+        for u in unmanaged:
+            print(f"| {u} | *unmanaged* |  |  |  | run `adopt-one {u}` |")
+        return
+
+    rows = []
+    for r in report:
+        flags = []
+        if r["hold"]:
+            flags.append("HOLD")
+        if r["drift"]:
+            flags.append("drift")
+        if r["missing"]:
+            flags.append("MISSING")
+        rows.append([r["name"], r["channel"], r["upstream"],
+                     r["commit"] or r["version"] or "", ",".join(flags)])
+    print_table(rows, ["skill", "channel", "upstream", "installed", "flags"])
+    print(f"\n{len(report)} managed skills in {skills_dir}")
+    drifted = [r["name"] for r in report if r["drift"]]
+    if drifted:
+        print(f"modified since snapshot: {', '.join(drifted)} "
+              "(deliberate? run `snapshot <name>` to accept as baseline)")
+    if unmanaged:
+        print(f"on disk but unmanaged: {', '.join(unmanaged)} — register with `adopt-one <name>`")
+    if strays:
+        print(f"non-skill entries: {', '.join(s.name for s in strays)}")
+
+
+# --------------------------------------------------------------------------
+# snapshot / hold / adopt-one / set-source / discover
+# --------------------------------------------------------------------------
+
+def cmd_snapshot(args):
+    skills_dir = get_skills_dir(args)
+    manifest = Manifest.load(skills_dir)
+    for name in args.names:
+        e = manifest.skills.get(name)
+        if not e:
+            warn(f"not in manifest: {name}")
+            continue
+        d = skills_dir / name
+        if not d.is_dir():
+            warn(f"not on disk: {name}")
+            continue
+        e["installed"]["treeHash"] = tree_hash(d)
+        e["installed"]["updatedAt"] = today()
+        print(f"snapshot recorded for {name}")
+    manifest.save()
+
+
+def cmd_hold(args):
+    skills_dir = get_skills_dir(args)
+    manifest = Manifest.load(skills_dir)
+    e = manifest.skills.get(args.name)
+    if not e:
+        die(f"not in manifest: {args.name}")
+    e["hold"] = not args.off
+    if args.note:
+        e["adaptations"] = args.note
+    manifest.save()
+    print(f"{args.name}: hold={'on' if e['hold'] else 'off'}")
+
+
+def cmd_adopt_one(args):
+    skills_dir = get_skills_dir(args)
+    manifest = Manifest.load(skills_dir)
+    name = args.name
+    if name in manifest.skills:
+        die(f"{name} is already managed")
+    d = skills_dir / name
+    if not (d / "SKILL.md").is_file():
+        die(f"{d} is not a skill directory (no SKILL.md)")
+    entry = classify_for_adopt(name, d)
+    if args.channel:
+        entry["channel"] = args.channel
+    if args.repo:
+        entry["channel"] = "git"
+        entry["source"] = {"repo": args.repo, "subdir": args.subdir or "", "ref": "HEAD"}
+        if args.commit:
+            entry["installed"]["commit"] = args.commit
+    print(f"{name}: channel={entry['channel']}, upstream={fmt_upstream(entry)}")
+    if entry.get("note"):
+        print(f"  note: {entry['note']}")
+    if not confirm("Register this skill?", default=True, assume_yes=args.yes):
+        print("aborted")
+        return
+    manifest.skills[name] = entry
+    manifest.save()
+    print(f"registered {name}")
+
+
+def cmd_set_source(args):
+    skills_dir = get_skills_dir(args)
+    manifest = Manifest.load(skills_dir)
+    e = manifest.skills.get(args.name)
+    if not e:
+        die(f"not in manifest: {args.name}")
+    channel = args.channel or "git"
+    e["channel"] = channel
+    if channel == "git":
+        repo = normalize_repo_url(args.repo) or args.repo
+        e["source"] = {"repo": repo, "subdir": args.subdir or "", "ref": args.ref or "HEAD"}
+        e.pop("cli", None)
+        e.pop("monorepo", None)
+    elif channel == "monorepo":
+        e["monorepo"] = {"sourcePath": args.repo, "note": "set via set-source"}
+        e.pop("source", None)
+        e.pop("cli", None)
+    if args.commit:
+        e["installed"]["commit"] = args.commit
+    e.pop("note", None)
+    manifest.save()
+    print(f"{args.name}: upstream set to {fmt_upstream(e)}")
+
+
+DISCOVER_HELP = """\
+Agent workflow (documented in the skills-manager SKILL.md):
+  1. Use WebSearch / code-search MCPs (grep.app, exa) / `gh api search/code`
+     on the exact phrases below to locate the upstream repository.
+  2. Verify: compare the candidate repo's SKILL.md name/description with the
+     local one before trusting it.
+  3. Record: skills-manager set-source <name> --repo <URL> [--subdir P] [--commit SHA]
+"""
+
+
+def cmd_discover(args):
+    skills_dir = get_skills_dir(args)
+    manifest = Manifest.load(skills_dir)
+    targets = args.names or [n for n, e in manifest.skills.items()
+                             if e["channel"] == "local"]
+    briefs = []
+    for name in sorted(targets):
+        e = manifest.skills.get(name)
+        if not e:
+            warn(f"not in manifest: {name}")
+            continue
+        d = skills_dir / name
+        if not d.is_dir():
+            warn(f"not on disk: {name}")
+            continue
+        fm = parse_frontmatter(d) or {}
+        body = skill_body(d)
+        phrases = []
+        for line in body.splitlines():
+            clean = re.sub(r"[#>*`\[\]|_-]", "", line).strip()
+            if 40 <= len(clean) <= 120 and not clean.startswith("http"):
+                phrases.append(clean)
+            if len(phrases) >= 3:
+                break
+        files = sorted(p.relative_to(d).as_posix() for p in d.rglob("*")
+                       if p.is_file() and ".git" not in p.parts)[:25]
+        briefs.append({
+            "skill": name,
+            "description": fm.get("description"),
+            "urlHints": find_url_hints(d),
+            "distinctivePhrases": phrases,
+            "files": files,
+            "suggestedQueries": [
+                f'"{name}" SKILL.md github',
+                f'"{phrases[0]}"' if phrases else f'"{name}" agent skill',
+            ],
+        })
+    if args.json:
+        print(json.dumps({"briefs": briefs, "next": "set-source <name> --repo <URL>"}, indent=2))
+        return
+    for b in briefs:
+        print(f"\n=== {b['skill']} ===")
+        print(f"description: {b['description']}")
+        if b["urlHints"]:
+            print(f"url hints in files: {', '.join(b['urlHints'])}")
+        print("distinctive phrases (use as exact-match search strings):")
+        for p in b["distinctivePhrases"]:
+            print(f'  - "{p}"')
+        print(f"suggested queries: {b['suggestedQueries']}")
+    print("\n" + DISCOVER_HELP)
+
+
+# --------------------------------------------------------------------------
+# add
+# --------------------------------------------------------------------------
+
+def cmd_add(args):
+    skills_dir = get_skills_dir(args)
+    manifest = Manifest.load(skills_dir)
+    src = resolve_source(args.source)
+    print(f"fetching {src['repo']} (ref {src['ref']}) ...")
+    cache, commit = ensure_repo(src["repo"], src["ref"])
+    skills = find_skills_in(cache, src["subdir"])
+    if not skills:
+        die("no SKILL.md found in the fetched source")
+
+    plugin = plugin_info(cache)
+    if plugin and len(skills) > 1 and plugin["artifacts"]:
+        print(f"\nThis repo is a {plugin['kind']} '{plugin['name']}' with {len(skills)} skills "
+              f"AND extra artifacts: {', '.join(plugin['artifacts'])}.")
+        print("Recommended: install it as a plugin through your harness so the extra "
+              "artifacts work (must be done per-harness):")
+        print(f"  claude:   /plugin  (marketplace {src['repo']})")
+        print(f"  opencode: add to the plugin array in opencode.json")
+        if not confirm("Vendor only the skills locally anyway?", default=False, assume_yes=args.yes):
+            print("nothing installed")
+            return
+    elif len(skills) > 1:
+        print(f"\nFound {len(skills)} skills in {src['repo']}:")
+        for s in skills:
+            print(f"  {s['name']}: {short_description(s['fm'])}")
+
+    selected = skills
+    if args.skill:
+        wanted = set(args.skill)
+        selected = [s for s in skills if s["name"] in wanted]
+        missing = wanted - {s["name"] for s in selected}
+        if missing:
+            die(f"skills not found in source: {', '.join(sorted(missing))}")
+    elif len(skills) > 1 and not args.all:
+        if not interactive() or args.yes:
+            die("multiple skills found — pass --all or --skill NAME")
+        picked = input("Install which? (names comma-separated, or 'all'): ").strip()
+        if picked.lower() == "all":
+            selected = skills
+        else:
+            wanted = {p.strip() for p in picked.split(",") if p.strip()}
+            selected = [s for s in skills if s["name"] in wanted]
+            if not selected:
+                die("nothing selected")
+
+    if args.name and len(selected) == 1:
+        selected[0]["name"] = args.name
+
+    if args.dry_run:
+        for s in selected:
+            print(f"dry-run: would install {s['name']} from {src['repo']}:{s['subdir']} @ {commit[:9]}")
+        return
+
+    for s in selected:
+        name = s["name"]
+        dest = skills_dir / name
+        if dest.exists():
+            if not confirm(f"{name} already exists in {skills_dir} — overwrite (backup kept)?",
+                           default=False, assume_yes=args.yes):
+                print(f"  skipped {name}")
+                continue
+        tree = install_from_cache(cache, commit, s["subdir"], dest)
+        fm = parse_frontmatter(dest) or {}
+        manifest.skills[name] = new_entry(
+            "git", short_description(fm),
+            source={"repo": src["repo"], "subdir": s["subdir"], "ref": src["ref"]},
+            commit=commit,
+            version=str((fm.get("metadata") or {}).get("version") or "") or None,
+            tree=tree)
+        print(f"installed {name} @ {commit[:9]}")
+    manifest.save()
+
+
+# --------------------------------------------------------------------------
+# update
+# --------------------------------------------------------------------------
+
+def show_diff(a: Path, b: Path, label_a: str, label_b: str):
+    print(f"\n--- diff: {label_a} -> {label_b} ---")
+    r = subprocess.run(["git", "diff", "--no-index", "--color", "--stat", "-p",
+                        str(a), str(b)], text=True)
+    if r.returncode not in (0, 1):
+        warn("git diff failed")
+
+
+def baseline_tree(cache: Path, entry: dict, tmp_root: Path) -> Path | None:
+    """Extract the pinned-commit tree (the 'installed' baseline) into a temp dir."""
+    pinned = entry["installed"].get("commit")
+    if not pinned:
+        return None
+    full = resolve_commit(cache, pinned)
+    if not full:
+        return None
+    dest = tmp_root / "baseline"
+    try:
+        extract_tree(cache, full, entry.get("source", {}).get("subdir", ""), dest)
+    except SystemExit:
+        return None
+    return dest
+
+
+def locate_subdir(cache: Path, name: str) -> str | None:
+    """Find which subdir of the repo holds the skill called <name>.
+    Used when the manifest has subdir '' but the repo hosts several skills."""
+    matches = [s for s in find_skills_in(cache, "") if s["name"] == name]
+    if matches:
+        return matches[0]["subdir"]
+    if (cache / "SKILL.md").is_file():
+        return ""
+    return None
+
+
+def update_git_skill(name: str, entry: dict, skills_dir: Path, args) -> tuple[str, bool]:
+    """Returns (result, applied)."""
+    src = entry.get("source") or {}
+    repo, ref, subdir = src.get("repo"), src.get("ref", "HEAD"), src.get("subdir", "")
+    if not repo:
+        return ("no repo recorded — use set-source", False)
+    d = skills_dir / name
+    if not d.is_dir():
+        return ("missing on disk", False)
+
+    pinned = entry["installed"].get("commit")
+    if args.dry_run:
+        upstream = ls_remote(repo, ref)
+        if upstream is None:
+            return ("upstream unreachable", False)
+        local_dirty = (entry["installed"].get("treeHash")
+                       and tree_hash(d) != entry["installed"]["treeHash"])
+        if pinned and (upstream == pinned or upstream.startswith(pinned) or pinned.startswith(upstream[:len(pinned)])):
+            state = "up to date"
+        elif pinned:
+            state = f"update available ({pinned[:9]} -> {upstream[:9]})"
+        else:
+            state = f"unpinned (upstream {upstream[:9]})"
+        if local_dirty:
+            state += ", local edits"
+        return (state, "update available" in state or "unpinned" in state)
+
+    cache, new_commit = ensure_repo(repo, ref)
+    if not subdir:
+        found = locate_subdir(cache, name)
+        if found is None:
+            return (f"cannot locate skill '{name}' inside {repo} — set --subdir via set-source", False)
+        if found:
+            subdir = found
+            entry["source"]["subdir"] = found
+    pinned_full = resolve_commit(cache, pinned) if pinned else None
+    upstream_moved = pinned_full != new_commit
+    stored_hash = entry["installed"].get("treeHash")
+    local_dirty = bool(stored_hash and tree_hash(d) != stored_hash)
+
+    if not upstream_moved and not local_dirty:
+        return ("up to date", False)
+
+    fm_local = parse_frontmatter(d)
+    with tempfile.TemporaryDirectory(prefix="skm-upd-") as td:
+        tmp_root = Path(td)
+        new_tree = tmp_root / "new"
+        extract_tree(cache, new_commit, subdir, new_tree)
+        fm_new = parse_frontmatter(new_tree)
+        base = baseline_tree(cache, entry, tmp_root) if (local_dirty or not upstream_moved) else None
+
+        reasons = breaking_reasons(cache, pinned_full, new_commit, subdir, fm_local, fm_new) \
+            if upstream_moved else []
+        hold = bool(entry.get("hold"))
+
+        header = f"\n== {name} =="
+        print(header)
+        if upstream_moved:
+            log = git_log_range(cache, pinned_full, new_commit, subdir)
+            print(f"  upstream: {pinned[:9] if pinned else '(unpinned)'} -> {new_commit[:9]} "
+                  f"({len(log)} commits touching this skill)")
+            for line in log[:8]:
+                print(f"    {line}")
+        if local_dirty:
+            print("  LOCAL EDITS detected (disk differs from installed snapshot)")
+        if hold:
+            print(f"  HOLD is set. adaptations: {entry.get('adaptations')}")
+        for r in reasons:
+            print(f"  BREAKING? {r}")
+
+        def apply_update() -> tuple[str, bool]:
+            tree = install_from_cache(cache, new_commit, subdir, d)
+            entry["installed"].update({"commit": new_commit, "treeHash": tree,
+                                       "updatedAt": today()})
+            v = ((fm_new or {}).get("metadata") or {}).get("version")
+            if v:
+                entry["installed"]["version"] = str(v)
+            return (f"updated to {new_commit[:9]}", True)
+
+        # case: local edits only, upstream unchanged
+        if local_dirty and not upstream_moved:
+            choice = ask(f"{name}: locally modified, upstream unchanged",
+                         {"s": "skip (keep local edits)",
+                          "a": "accept edits as new baseline (snapshot)",
+                          "d": "show diff (installed -> disk)",
+                          "r": "revert to installed version (backup kept)"},
+                         default="s", assume_yes=args.yes)
+            while choice == "d":
+                if base:
+                    show_diff(base, d, "installed", "disk")
+                else:
+                    print("  (pinned baseline unavailable — cannot diff)")
+                choice = ask("next", {"s": "skip", "a": "accept as baseline", "r": "revert"},
+                             default="s")
+            if choice == "a":
+                entry["installed"]["treeHash"] = tree_hash(d)
+                entry["installed"]["updatedAt"] = today()
+                return ("local edits accepted as baseline", True)
+            if choice == "r":
+                if not base:
+                    return ("cannot revert: pinned commit unavailable", False)
+                bk = backup_tree(d, name)
+                shutil.copytree(base, d)
+                entry["installed"]["treeHash"] = tree_hash(d)
+                print(f"  reverted; edited copy backed up to {bk}")
+                return ("reverted to installed version", True)
+            return ("skipped (local edits kept)", False)
+
+        # case: upstream moved, clean local tree
+        if upstream_moved and not local_dirty:
+            auto_ok = args.yes and not hold and not reasons
+            if auto_ok:
+                return apply_update()
+            choice = ask(f"{name}: update available",
+                         {"u": "update", "d": "show diff (installed -> new)", "s": "skip"},
+                         default="s" if (hold or reasons) else "u", assume_yes=False)
+            while choice == "d":
+                ref_tree = base or d
+                show_diff(ref_tree, new_tree, "installed", "new upstream")
+                choice = ask("next", {"u": "update", "s": "skip"},
+                             default="s" if (hold or reasons) else "u")
+            if choice == "u":
+                if hold and not confirm_typed(f"{name} is on HOLD — overwrite with upstream?",
+                                              "overwrite"):
+                    return ("skipped (hold)", False)
+                return apply_update()
+            return ("skipped", False)
+
+        # case: both moved — conflict
+        choice = ask(f"{name}: CONFLICT — upstream moved AND local edits exist",
+                     {"s": "skip (keep local)",
+                      "o": "overwrite with upstream (local copy backed up)",
+                      "d": "diff local (installed -> disk)",
+                      "n": "diff upstream (installed -> new)"},
+                     default="s", assume_yes=args.yes)
+        while choice in ("d", "n"):
+            if choice == "d":
+                if base:
+                    show_diff(base, d, "installed", "disk (local edits)")
+                else:
+                    print("  (pinned baseline unavailable)")
+            else:
+                show_diff(base or d, new_tree, "installed" if base else "disk", "new upstream")
+            choice = ask("next", {"s": "skip", "o": "overwrite", "d": "diff local",
+                                  "n": "diff upstream"}, default="s")
+        if choice == "o":
+            if entry.get("adaptations"):
+                print(f"  adaptations you would lose: {entry['adaptations']}")
+            if not confirm_typed(f"overwrite {name} (local edits go to backup)", "overwrite"):
+                return ("skipped (conflict)", False)
+            return apply_update()
+        return ("skipped (conflict — local edits kept)", False)
+
+
+def cmd_update(args):
+    skills_dir = get_skills_dir(args)
+    manifest = Manifest.load(skills_dir)
+    names = args.names or sorted(manifest.skills)
+    unknown = [n for n in names if n not in manifest.skills]
+    if unknown:
+        die(f"not in manifest: {', '.join(unknown)}")
+
+    updates_available = False
+    results: dict[str, str] = {}
+    cli_groups: dict[str, list[str]] = {}
+
+    for name in names:
+        entry = manifest.skills[name]
+        ch = entry["channel"]
+        if ch == "local":
+            results[name] = "local — no upstream, skipped"
+        elif ch == "cli":
+            group = entry.get("cli", {}).get("group", name)
+            cli_groups.setdefault(group, []).append(name)
+        elif ch == "monorepo":
+            results[name] = update_monorepo_skill(name, entry, skills_dir, args)
+        elif ch == "git":
+            state, flag = update_git_skill(name, entry, skills_dir, args)
+            results[name] = state
+            updates_available = updates_available or flag
+
+    for group, members in cli_groups.items():
+        refresh = manifest.skills[members[0]].get("cli", {}).get("refreshCommand")
+        if not refresh:
+            for m in members:
+                results[m] = f"managed by {group} (hands-off), skipped"
+            continue
+        if args.dry_run:
+            for m in members:
+                results[m] = f"cli group '{group}': would run `{refresh}`"
+            continue
+        print(f"\ncli group '{group}' ({len(members)} skills): refresh command is `{refresh}`")
+        if not confirm(f"Run `{refresh}` now?", default=True, assume_yes=args.yes):
+            for m in members:
+                results[m] = "skipped"
+            continue
+        r = subprocess.run(refresh, shell=True, cwd=str(skills_dir.parent))
+        if r.returncode != 0:
+            for m in members:
+                results[m] = f"refresh command failed (exit {r.returncode})"
+            continue
+        for m in members:
+            d = skills_dir / m
+            if d.is_dir():
+                old = manifest.skills[m]["installed"].get("treeHash")
+                new = tree_hash(d)
+                changed = old != new
+                manifest.skills[m]["installed"]["treeHash"] = new
+                manifest.skills[m]["installed"]["updatedAt"] = today()
+                results[m] = "refreshed (changed)" if changed else "refreshed (no change)"
+            else:
+                results[m] = "missing after refresh!"
+
+    print()
+    rows = [[n, manifest.skills[n]["channel"], results.get(n, "?")] for n in names]
+    print_table(rows, ["skill", "channel", "result"])
+
+    if not args.dry_run:
+        manifest.save()
+    if args.dry_run and updates_available:
+        sys.exit(2)
+
+
+def update_monorepo_skill(name: str, entry: dict, skills_dir: Path, args) -> str:
+    sp = entry.get("monorepo", {}).get("sourcePath", "")
+    candidates = [Path(sp).expanduser()]
+    if not sp.startswith(("/", "~")):
+        candidates += [Path.home() / sp, Path.home() / "workspace" / sp,
+                       Path.home() / "workspace" / "masorange" / "repos" / sp]
+    source = next((c for c in candidates if c.is_dir()), None)
+    if source is None:
+        return "monorepo source unavailable, skipped"
+    d = skills_dir / name
+    if not d.is_dir():
+        return "missing on disk"
+    src_hash, disk_hash = tree_hash(source), tree_hash(d)
+    if src_hash == disk_hash:
+        return "in sync with monorepo source"
+    if args.dry_run:
+        return f"differs from monorepo source ({source})"
+    choice = ask(f"{name}: differs from monorepo source {source}",
+                 {"u": "sync from source (backup kept)", "d": "show diff", "s": "skip"},
+                 default="s", assume_yes=args.yes)
+    while choice == "d":
+        show_diff(d, source, "local", "monorepo source")
+        choice = ask("next", {"u": "sync", "s": "skip"}, default="s")
+    if choice == "u":
+        bk = backup_tree(d, name)
+        shutil.copytree(source, d, ignore=shutil.ignore_patterns(".git"))
+        entry["installed"]["treeHash"] = tree_hash(d)
+        entry["installed"]["updatedAt"] = today()
+        print(f"  synced; previous copy backed up to {bk}")
+        return "synced from monorepo source"
+    return "skipped"
+
+
+# --------------------------------------------------------------------------
+# remove
+# --------------------------------------------------------------------------
+
+def cmd_remove(args):
+    skills_dir = get_skills_dir(args)
+    manifest = Manifest.load(skills_dir)
+    name = args.name
+    d = skills_dir / name
+    in_manifest = name in manifest.skills
+    if not d.exists() and not in_manifest:
+        die(f"unknown skill: {name}")
+    if d.exists():
+        n_files = sum(1 for p in d.rglob("*") if p.is_file())
+        print(f"will remove {d} ({n_files} files — moved to backup, not deleted)")
+    if not confirm(f"Remove skill '{name}'?", default=False, assume_yes=args.yes):
+        print("aborted")
+        return
+    if d.exists():
+        bk = backup_tree(d, name)
+        print(f"moved to {bk}")
+    if in_manifest:
+        del manifest.skills[name]
+        manifest.save()
+        print("manifest entry removed")
+
+
+# --------------------------------------------------------------------------
+# argparse wiring
+# --------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--dir", help=f"skills directory (default: {DEFAULT_SKILLS_DIR})")
+    common.add_argument("-n", "--dry-run", action="store_true", help="report only, change nothing")
+    common.add_argument("-y", "--yes", action="store_true", help="auto-confirm safe steps")
+
+    p = argparse.ArgumentParser(
+        prog="skills-manager",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("init", parents=[common], help="adopt an existing skills dir into a manifest")
+    sp.add_argument("--force", action="store_true", help="re-adopt even if a manifest exists")
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("add", parents=[common], help="install skill(s) from a repo/URL/path")
+    sp.add_argument("source", help="owner/repo[/subdir], git/GitHub/gist URL, or local repo path")
+    sp.add_argument("--skill", action="append", help="install only this skill (repeatable)")
+    sp.add_argument("--all", action="store_true", help="install every skill found")
+    sp.add_argument("--name", help="alias for the installed skill (single-skill only)")
+    sp.set_defaults(func=cmd_add)
+
+    sp = sub.add_parser("update", parents=[common], help="check/apply updates")
+    sp.add_argument("names", nargs="*", help="skills to update (default: all)")
+    sp.set_defaults(func=cmd_update)
+
+    sp = sub.add_parser("remove", parents=[common], help="remove a skill (moved to backup)")
+    sp.add_argument("name")
+    sp.set_defaults(func=cmd_remove)
+
+    sp = sub.add_parser("status", parents=[common], aliases=["list"],
+                        help="show the register (manifest ⋈ disk)")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--md", action="store_true", help="render as markdown to stdout")
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("adopt-one", parents=[common], help="register one unmanaged skill dir")
+    sp.add_argument("name")
+    sp.add_argument("--channel", choices=["git", "cli", "monorepo", "local"])
+    sp.add_argument("--repo")
+    sp.add_argument("--subdir")
+    sp.add_argument("--commit")
+    sp.set_defaults(func=cmd_adopt_one)
+
+    sp = sub.add_parser("snapshot", parents=[common],
+                        help="accept current disk state as the new baseline")
+    sp.add_argument("names", nargs="+")
+    sp.set_defaults(func=cmd_snapshot)
+
+    sp = sub.add_parser("hold", parents=[common], help="toggle the hold flag")
+    sp.add_argument("name")
+    sp.add_argument("--off", action="store_true")
+    sp.add_argument("--note", help="adaptations note")
+    sp.set_defaults(func=cmd_hold)
+
+    sp = sub.add_parser("discover", parents=[common],
+                        help="research brief for skills with unknown upstream")
+    sp.add_argument("names", nargs="*")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_discover)
+
+    sp = sub.add_parser("set-source", parents=[common],
+                        help="record a discovered/corrected upstream")
+    sp.add_argument("name")
+    sp.add_argument("--repo", required=True)
+    sp.add_argument("--subdir")
+    sp.add_argument("--ref")
+    sp.add_argument("--commit")
+    sp.add_argument("--channel", choices=["git", "monorepo"])
+    sp.set_defaults(func=cmd_set_source)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
