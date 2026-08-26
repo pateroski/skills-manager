@@ -70,6 +70,12 @@ skills-manager adopt-one NAME      # register a dir that appeared after init
 
 ## Rules the agent must respect
 
+- **Never classify a copied skill as `disk` or `local` without researching its
+  real upstream first.** A skill copied from a directory usually originates
+  from a git repo or a CLI tool. Before adopting/adding it, run `discover`,
+  search the web and GitHub code for its distinctive phrases, check for CLI
+  ownership markers (e.g. OpenSpec's `.openspec-target`), and only fall back
+  to `disk`/`local` when no verifiable upstream exists.
 - **Never hand-update `cli`-channel skills.** The plannotator group is
   hands-off (its binary rewrites those skills); the hyperframes group is
   refreshed only via its own command, which `update` runs for you.
