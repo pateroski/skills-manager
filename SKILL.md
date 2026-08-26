@@ -10,7 +10,7 @@ description: >
   protection, breaking-change advisories).
 metadata:
   source: github.com/pateroski/skills-manager
-  version: 0.1.0
+  version: 0.2.0
 ---
 
 # skills-manager
@@ -50,7 +50,7 @@ skills-manager init --dir <folder>      # review, edit rows, confirm, write mani
 
 Works on any folder containing `*/SKILL.md`; no prior metadata needed.
 Classification order: known CLI groups → frontmatter `metadata.source` →
-URL hints → monorepo seed list → `local`. Skills with an embedded `.git`
+URL hints → disk-sync seed list → `local`. Skills with an embedded `.git`
 trigger a prompt to archive it to the backup area (recommended).
 
 ## Day-2 operations
