@@ -69,7 +69,7 @@ PLANNOTATOR_SKILLS = {
 # or a CLI that should own their updates.
 MONOREPO_SKILLS = {
     "nx-monorepo", "cfront-ai-news", "commit-and-push", "pr-create",
-    "pr-review", "learn", "playwright-cli",
+    "pr-review", "learn",
 }
 MONOREPO_SOURCE_PREFIX = "monorepo-front/.agents/skills"
 HOLD_SEEDS = {"learn-codebase", "learning-opportunities", "explain-diff", "humanizer"}
