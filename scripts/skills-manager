@@ -13,7 +13,7 @@ edits are always detected before an update can clobber them.
 Channels:
   git       upstream is a git repo (GitHub, any URL, or a local path);
             updates fetch + diff + interactive apply
-  cli       a tool owns the skill set (e.g. hyperframes, plannotator);
+  cli       a tool owns the skill set (a generator or installer binary);
             updates delegate to that tool's refresh command, or hands-off
   disk      one-way copy from a path on disk; updates sync when present
   local     no upstream; never touched by update
@@ -46,37 +46,31 @@ REPO_CACHE = CACHE_ROOT / "repos"
 BACKUP_ROOT = CACHE_ROOT / "backups"
 HASH_EXCLUDE_DIRS = {".git", "__pycache__", "node_modules"}
 HASH_EXCLUDE_FILES = {".DS_Store"}
-NON_SKILL_ROOT_FILES = {MANIFEST_NAME, MANIFEST_NAME + ".bak"}
+NON_SKILL_ROOT_FILES = {MANIFEST_NAME, MANIFEST_NAME + ".bak",
+                        "skills-manager.hints.json"}
 
-# --- Adoption seed lists: consulted only by `init` / `adopt-one`. ---------
-HYPERFRAMES_SKILLS = {
-    "hyperframes", "hyperframes-animation", "hyperframes-audio",
-    "hyperframes-cli", "hyperframes-core", "hyperframes-creative",
-    "hyperframes-keyframes", "hyperframes-registry", "embedded-captions",
-    "faceless-explainer", "figma", "general-video", "media-use",
-    "motion-graphics", "music-to-video", "pr-to-video",
-    "product-launch-video", "remotion-to-hyperframes", "slideshow",
-    "talking-head-recut",
-}
-PLANNOTATOR_SKILLS = {
-    "plannotator", "plannotator-annotate", "plannotator-last",
-    "plannotator-review", "plannotator-compound", "plannotator-setup-goal",
-    "plannotator-visual-explainer",
-}
-# Only skills VERIFIED to have no public upstream belong here. Never park a
-# copied skill in this list without researching its real origin first
-# (discover + web/code search) — most "copied" skills come from a git repo
-# or a CLI that should own their updates.
-MONOREPO_SKILLS = {
-    "nx-monorepo", "cfront-ai-news", "commit-and-push", "pr-create",
-    "pr-review", "learn", "playwright-cli",
-}
-MONOREPO_SOURCE_PREFIX = "monorepo-front/.agents/skills"
-HOLD_SEEDS = {"learn-codebase", "learning-opportunities", "explain-diff", "humanizer"}
-CLI_GROUPS = {
-    "hyperframes": {"refreshCommand": "npx -y hyperframes skills"},
-    "plannotator": {"refreshCommand": None},
-}
+# --- Adoption hints --------------------------------------------------------
+# Machine-specific adoption knowledge (which skills belong to which CLI
+# group, which are one-way disk copies, which carry local adaptations) does
+# NOT live in this script — anyone should be able to use it as-is. Put that
+# context in an optional skills-manager.hints.json next to the manifest;
+# `init` / `adopt-one` consult it when classifying:
+#
+#   {
+#     "cliGroups": {
+#       "<group>": {"owner": "<tool>", "refreshCommand": "<cmd or null>",
+#                    "skills": ["<name>", ...]}
+#     },
+#     "disk": {"sourcePathPrefix": "<dir the copies come from>",
+#              "note": "<free text>", "skills": ["<name>", ...],
+#              "searchPaths": ["<base dir to resolve relative sourcePaths>", ...]},
+#     "hold": ["<name>", ...]
+#   }
+#
+# Only skills VERIFIED to have no public upstream belong under "disk" —
+# research a copied skill's real origin (discover + web/code search, CLI
+# ownership markers) before parking it there.
+HINTS_FILENAME = "skills-manager.hints.json"
 
 URL_RE = re.compile(
     r"https?://(?:www\.)?(github\.com|gitlab\.com|gist\.github\.com)/[\w.\-]+(?:/[\w.\-]+)?"
@@ -260,6 +254,20 @@ class Manifest:
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(tmp, self.path)
+
+
+def load_hints(skills_dir: Path) -> dict:
+    """Optional per-machine adoption hints (see HINTS_FILENAME comment above)."""
+    for candidate in (skills_dir / HINTS_FILENAME, skills_dir.parent / HINTS_FILENAME):
+        if candidate.is_file():
+            try:
+                data = json.loads(candidate.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+                warn(f"ignoring hints file {candidate}: not a JSON object")
+            except (json.JSONDecodeError, OSError) as exc:
+                warn(f"ignoring unreadable hints file {candidate}: {exc}")
+    return {}
 
 
 def new_entry(channel: str, description: str, *, source: dict | None = None,
@@ -639,7 +647,8 @@ def print_table(rows: list[list[str]], headers: list[str]):
 # init / adopt
 # --------------------------------------------------------------------------
 
-def classify_for_adopt(name: str, skill_dir: Path) -> dict:
+def classify_for_adopt(name: str, skill_dir: Path, hints: dict | None = None) -> dict:
+    hints = hints or {}
     fm = parse_frontmatter(skill_dir)
     if fm is None:
         return new_entry("local", "", note="frontmatter unparseable",
@@ -649,25 +658,14 @@ def classify_for_adopt(name: str, skill_dir: Path) -> dict:
     adaptations = meta.get("adaptations")
     if isinstance(adaptations, (list, dict)):
         adaptations = json.dumps(adaptations, ensure_ascii=False)
-    hold = name in HOLD_SEEDS or bool(adaptations)
+    hold = name in (hints.get("hold") or []) or bool(adaptations)
     tree = tree_hash(skill_dir)
 
-    if name in HYPERFRAMES_SKILLS:
-        return new_entry("cli", desc, cli={"owner": "hyperframes",
-                         "refreshCommand": CLI_GROUPS["hyperframes"]["refreshCommand"],
-                         "group": "hyperframes"}, tree=tree)
-    if name in PLANNOTATOR_SKILLS:
-        return new_entry("cli", desc, cli={"owner": "plannotator",
-                         "refreshCommand": None, "group": "plannotator"}, tree=tree)
-
-    # OpenSpec's CLI owns skills it generated: it drops an ownership marker
-    # (.openspec-target) into the skills root, and `openspec update <project>`
-    # regenerates them (projectPath = two levels above the skills dir).
-    if name.startswith("openspec-") and (skill_dir.parent / ".openspec-target").is_file():
-        project = skill_dir.parent.parent
-        return new_entry("cli", desc, cli={"owner": "openspec",
-                         "refreshCommand": f'openspec update "{project}"',
-                         "group": "openspec"}, tree=tree)
+    for group, spec in (hints.get("cliGroups") or {}).items():
+        if name in (spec.get("skills") or []):
+            return new_entry("cli", desc, cli={"owner": spec.get("owner") or group,
+                             "refreshCommand": spec.get("refreshCommand"),
+                             "group": group}, tree=tree)
 
     src = meta.get("source")
     repo = normalize_repo_url(str(src)) if src else None
@@ -692,15 +690,19 @@ def classify_for_adopt(name: str, skill_dir: Path) -> dict:
         return new_entry("git", desc, source={"repo": repo, "subdir": "", "ref": "HEAD"},
                          tree=tree, hold=hold, adaptations=adaptations)
 
-    if name in MONOREPO_SKILLS:
+    disk_hints = hints.get("disk") or {}
+    if name in (disk_hints.get("skills") or []):
+        prefix = (disk_hints.get("sourcePathPrefix") or "").rstrip("/")
         return new_entry("disk", desc,
-                         disk={"sourcePath": f"{MONOREPO_SOURCE_PREFIX}/{name}",
-                                   "note": "one-way sync from work monorepo; source may be offline"},
+                         disk={"sourcePath": f"{prefix}/{name}" if prefix else name,
+                               "note": disk_hints.get("note")
+                               or "one-way copy from a directory on disk; source may be offline"},
                          version=str(meta.get("version")) if meta.get("version") else None,
                          tree=tree, hold=hold, adaptations=adaptations)
 
-    hints = find_url_hints(skill_dir)
-    note = f"url hints found: {', '.join(hints[:3])} — confirm with `set-source` or run `discover`" if hints else None
+    url_hints = find_url_hints(skill_dir)
+    note = (f"url hints found: {', '.join(url_hints[:3])} — confirm with `set-source` "
+            "or run `discover`") if url_hints else None
     return new_entry("local", desc, tree=tree, hold=hold, adaptations=adaptations, note=note)
 
 
@@ -714,10 +716,13 @@ def cmd_init(args):
     if not dirs:
         die(f"no skills (*/SKILL.md) found in {skills_dir}")
 
+    hints = load_hints(skills_dir)
+    if hints:
+        print(f"(using adoption hints from {HINTS_FILENAME})")
     print(f"Adopting {len(dirs)} skills in {skills_dir}\n")
     entries: dict[str, dict] = {}
     for d in dirs:
-        entries[d.name] = classify_for_adopt(d.name, d)
+        entries[d.name] = classify_for_adopt(d.name, d, hints)
 
     rows = []
     for name, e in sorted(entries.items()):
@@ -920,7 +925,7 @@ def cmd_adopt_one(args):
     d = skills_dir / name
     if not (d / "SKILL.md").is_file():
         die(f"{d} is not a skill directory (no SKILL.md)")
-    entry = classify_for_adopt(name, d)
+    entry = classify_for_adopt(name, d, load_hints(skills_dir))
     if args.channel:
         entry["channel"] = args.channel
     if args.repo:
@@ -1381,8 +1386,10 @@ def update_disk_skill(name: str, entry: dict, skills_dir: Path, args) -> str:
     sp = entry.get("disk", {}).get("sourcePath", "")
     candidates = [Path(sp).expanduser()]
     if not sp.startswith(("/", "~")):
-        candidates += [Path.home() / sp, Path.home() / "workspace" / sp,
-                       Path.home() / "workspace" / "masorange" / "repos" / sp]
+        # relative sourcePaths resolve against $HOME plus any hints searchPaths
+        candidates.append(Path.home() / sp)
+        for base in (load_hints(skills_dir).get("disk") or {}).get("searchPaths") or []:
+            candidates.append(Path(base).expanduser() / sp)
     source = next((c for c in candidates if c.is_dir()), None)
     if source is None:
         return "disk source unavailable, skipped"

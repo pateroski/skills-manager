@@ -49,9 +49,18 @@ skills-manager init --dir <folder>      # review, edit rows, confirm, write mani
 ```
 
 Works on any folder containing `*/SKILL.md`; no prior metadata needed.
-Classification order: known CLI groups → frontmatter `metadata.source` →
-URL hints → disk-sync seed list → `local`. Skills with an embedded `.git`
-trigger a prompt to archive it to the backup area (recommended).
+Classification order: CLI groups from the optional hints file → frontmatter
+`metadata.source` → URL hints → disk hints → `local`. The script knows no
+specific skill or tool — CLI ownership is something you discover while using
+the skill (see the research rule below) and record via `set-source
+--channel cli` or the hints file. Skills with an embedded `.git` trigger a
+prompt to archive it to the backup area.
+
+Machine-specific knowledge (CLI groups, disk-copied skills, hold names)
+never lives in the script — put it in `skills-manager.hints.json` next to
+the manifest (schema documented at the top of `scripts/skills-manager`).
+An existing manifest can regenerate it: group `cli` entries, `disk` entries,
+and `hold` flags.
 
 ## Day-2 operations
 
