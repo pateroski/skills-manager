@@ -77,6 +77,17 @@ skills-manager hold NAME [--off] [--note TEXT]
 skills-manager adopt-one NAME      # register a dir that appeared after init
 ```
 
+## Files in the skills root (not skills)
+
+The tool owns exactly three non-skill files next to the skill folders:
+`skills-manifest.json` (the register), `skills-manifest.json.bak` (the single
+rotated backup of the previous manifest — there is never more than one), and
+`skills-manager.hints.json` (optional per-machine hints). Anything else is
+flagged by `status`/`init` as a stray: investigate which tool put it there
+(installers like hyperframes' drop their own artifacts, e.g. a lockfile or
+test files) before whitelisting it in the hints `knownRootFiles` list or
+removing it — never delete a file another tool owns, it will come back.
+
 ## Rules the agent must respect
 
 - **Never classify a copied skill as `disk` or `local` without researching its
