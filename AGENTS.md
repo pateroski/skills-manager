@@ -62,6 +62,7 @@ Never run `init --force`, `update -y`, or `remove` without the user's explicit g
 ## Key concepts
 
 - **Manifest**: `<skills-dir>/skills-manifest.json` is the single source of truth — channel, upstream, pinned commit, and a tree hash per skill.
+- **Hints**: `skills-manager.hints.json` (optional, next to the manifest) carries machine-specific adoption knowledge — CLI groups, disk-copied skills, hold names. The script itself stays machine-agnostic; never hardcode a user's skills or paths into it.
 - **Channels**: `git` (fetch + diff + interactive apply), `cli` (a tool owns the skill set; delegate or hands-off), `disk` (one-way sync from a path on disk), `local` (no upstream, never touched).
 - **Safety invariants** (never weaken these): local edits are detected via tree hash before any overwrite; `hold` skills require a typed `overwrite`; removals and overwrites move the old tree to `~/.cache/skills-manager/backups/`; `-n` never writes outside the clone cache.
 
