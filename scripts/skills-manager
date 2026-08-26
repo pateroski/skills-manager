@@ -64,8 +64,14 @@ NON_SKILL_ROOT_FILES = {MANIFEST_NAME, MANIFEST_NAME + ".bak",
 #     "disk": {"sourcePathPrefix": "<dir the copies come from>",
 #              "note": "<free text>", "skills": ["<name>", ...],
 #              "searchPaths": ["<base dir to resolve relative sourcePaths>", ...]},
-#     "hold": ["<name>", ...]
+#     "hold": ["<name>", ...],
+#     "knownRootFiles": ["<vetted non-skill file in the skills root>", ...],
+#     "notes": {"<anything>": "<free text for humans; the script ignores this>"}
 #   }
+#
+# Non-skill files in the skills root are flagged by `status`/`init` unless
+# listed in knownRootFiles — vet a stray file (which tool owns it? is it
+# safe?) before whitelisting or removing it.
 #
 # Only skills VERIFIED to have no public upstream belong under "disk" —
 # research a copied skill's real origin (discover + web/code search, CLI
@@ -603,15 +609,16 @@ def get_skills_dir(args) -> Path:
 
 def scan_skill_dirs(skills_dir: Path) -> tuple[list[Path], list[Path]]:
     dirs, strays = [], []
+    known = set((load_hints(skills_dir).get("knownRootFiles")) or [])
     for entry in sorted(skills_dir.iterdir()):
         if entry.name.startswith("."):
             continue
         if entry.is_dir():
             if (entry / "SKILL.md").is_file():
                 dirs.append(entry)
-            else:
+            elif entry.name not in known:
                 strays.append(entry)
-        elif entry.name not in NON_SKILL_ROOT_FILES:
+        elif entry.name not in NON_SKILL_ROOT_FILES and entry.name not in known:
             strays.append(entry)
     return dirs, strays
 
